@@ -6,7 +6,7 @@
 ///
 SurgeLv2Wrapper::SurgeLv2Wrapper(double sampleRate)
     : _synthesizer(new SurgeSynthesizer(this)), _dataLocation(new void*[NumPorts]()),
-      _oldControlValues(new float[n_total_params]()), _sampleRate(sampleRate)
+      _sampleRate(sampleRate)
 {
    // needed?
    _synthesizer->time_data.ppqPos = 0;
@@ -56,13 +56,24 @@ LV2_Handle SurgeLv2Wrapper::instantiate(const LV2_Descriptor* descriptor,
    self->_uridAtomInt = featureUridMap->map(featureUridMap->handle, LV2_ATOM__Int);
    self->_uridAtomLong = featureUridMap->map(featureUridMap->handle, LV2_ATOM__Long);
    self->_uridAtomChunk = featureUridMap->map(featureUridMap->handle, LV2_ATOM__Chunk);
+   self->_uridAtomURID = featureUridMap->map(featureUridMap->handle, LV2_ATOM__URID);
    self->_uridTimePosition = featureUridMap->map(featureUridMap->handle, LV2_TIME__Position);
    self->_uridTime_beatsPerMinute =
        featureUridMap->map(featureUridMap->handle, LV2_TIME__beatsPerMinute);
    self->_uridTime_speed = featureUridMap->map(featureUridMap->handle, LV2_TIME__speed);
    self->_uridTime_beat = featureUridMap->map(featureUridMap->handle, LV2_TIME__beat);
+   self->_uridPatchSet = featureUridMap->map(featureUridMap->handle, LV2_PATCH__Set);
+   self->_uridPatch_property = featureUridMap->map(featureUridMap->handle, LV2_PATCH__property);
+   self->_uridPatch_value = featureUridMap->map(featureUridMap->handle, LV2_PATCH__value);
 
    self->_uridSurgePatch = featureUridMap->map(featureUridMap->handle, SURGE_PATCH_URI);
+
+   for (unsigned pNth = 0; pNth < n_total_params; ++pNth)
+   {
+      LV2_URID urid = featureUridMap->map(featureUridMap->handle, self->getParameterUri(pNth).c_str());
+      self->_uridSurgeParameter[pNth] = urid;
+      self->_surgeParameterUrid[urid] = pNth;
+   }
 
    return (LV2_Handle)self.release();
 }
@@ -83,17 +94,6 @@ void SurgeLv2Wrapper::activate(LV2_Handle instance)
    SurgeSynthesizer* s = self->_synthesizer.get();
 
    self->_blockPos = 0;
-
-   for (unsigned pNth = 0; pNth < n_total_params; ++pNth)
-   {
-      unsigned index = s->remapExternalApiToInternalId(pNth);
-      self->_oldControlValues[pNth] = s->getParameter01(index);
-#if DEBUG_STARTUP_SETS      
-      if( index == 118 )
-         std::cout << "ACTIVATE " << pNth << " " << self->_oldControlValues[pNth] << std::endl;
-#endif      
-   }
-
    s->audio_processing_active = true;
 }
 
@@ -104,23 +104,6 @@ void SurgeLv2Wrapper::run(LV2_Handle instance, uint32_t sample_count)
    double sampleRate = self->_sampleRate;
 
    self->_fpuState.set();
-
-   for (unsigned pNth = 0; pNth < n_total_params; ++pNth)
-   {
-      float portValue = *(float*)(self->_dataLocation[pNth]);
-;
-      if (portValue != self->_oldControlValues[pNth])
-      {
-#if DEBUG_STARTUP_SETS
-         if( pNth == 118 )
-            std::cout << "LV2 at " << pNth << " portValue=" << portValue
-                      << " ocv=" << self->_oldControlValues[pNth] << std::endl;
-#endif         
-         unsigned index = s->remapExternalApiToInternalId(pNth);
-         s->setParameter01(index, portValue);
-         self->_oldControlValues[pNth] = portValue;
-      }
-   }
 
    bool isPlaying = SurgeLv2::isNotZero(self->_timePositionSpeed);
    bool hasValidTempo = SurgeLv2::isGreaterThanZero(self->_timePositionTempoBpm);
@@ -139,7 +122,7 @@ void SurgeLv2Wrapper::run(LV2_Handle instance, uint32_t sample_count)
    if (isPlaying && hasValidPosition)
       s->time_data.ppqPos = self->_timePositionBeat; // TODO is it correct?
 
-   auto* eventSequence = (const LV2_Atom_Sequence*)self->_dataLocation[pEvents];
+   auto* eventSequence = (const LV2_Atom_Sequence*)self->_dataLocation[pEventsIn];
    const LV2_Atom_Event* eventIter = lv2_atom_sequence_begin(&eventSequence->body);
    const LV2_Atom_Event* event = SurgeLv2::popNextEvent(eventSequence, &eventIter);
 
@@ -207,6 +190,8 @@ void SurgeLv2Wrapper::run(LV2_Handle instance, uint32_t sample_count)
 
 void SurgeLv2Wrapper::handleEvent(const LV2_Atom_Event* event)
 {
+   SurgeSynthesizer* s = _synthesizer.get();
+
    if (event->body.type == _uridMidiEvent)
    {
       const char* midiData = (char*)event + sizeof(*event);
@@ -252,6 +237,35 @@ void SurgeLv2Wrapper::handleEvent(const LV2_Atom_Event* event)
       else if ((status == 0xfc) || (status == 0xff)) //  MIDI STOP or reset
       {
          _synthesizer->allNotesOff();
+      }
+   }
+   else if ((event->body.type == _uridAtomBlank || event->body.type == _uridAtomObject) &&
+            (((const LV2_Atom_Object*)&event->body)->body.otype) == _uridPatchSet)
+   {
+      const LV2_Atom_Object* obj = (const LV2_Atom_Object*)&event->body;
+      const LV2_Atom* property = nullptr;
+      const LV2_Atom* value = nullptr;
+
+      lv2_atom_object_get(obj, _uridPatch_property, &property, _uridPatch_value, &value, 0);
+
+      if (!property || !value || property->type != _uridAtomURID)
+      {
+         // malformed patch message
+         return;
+      }
+
+      if (value->type == _uridAtomFloat)
+      {
+         const LV2_URID urid = ((const LV2_Atom_URID*)property)->body;
+         const float value = ((const LV2_Atom_Float*)property)->body;
+
+         auto it = _surgeParameterUrid.find(urid);
+         if (it != _surgeParameterUrid.end())
+         {
+            unsigned pNth = it->second;
+            unsigned index = s->remapExternalApiToInternalId(pNth);
+            s->setParameter01(index, value);
+         }
       }
    }
    else if ((event->body.type == _uridAtomBlank || event->body.type == _uridAtomObject) &&
@@ -358,21 +372,34 @@ LV2_State_Status SurgeLv2Wrapper::restoreState(LV2_Handle instance, LV2_State_Re
    s->loadRaw(data, size, false);
    s->loadFromDawExtraState();
 
-   // Restore the port-cache-check with the loadRaw state since the synth is now in good shape
-   for (unsigned pNth = 0; pNth < n_total_params; ++pNth)
-   {
-      unsigned index = s->remapExternalApiToInternalId(pNth);
-      float v = s->getParameter01(index);
-#if DEBUG_STARTUP_SETS
-      if( index == 118 )
-         std::cout << "after restore old control values set to " << v << std::endl;
-#endif         
-      self->_oldControlValues[pNth] = v;
-   }   
-   
    // TODO also load editor stuff?
 
    return LV2_STATE_SUCCESS;
+}
+
+std::string SurgeLv2Wrapper::getParameterSymbol(unsigned pNth) const
+{
+   unsigned index = _synthesizer->remapExternalApiToInternalId(pNth);
+   parametermeta pMeta;
+   _synthesizer->getParameterMeta(index, pMeta);
+
+   std::string pSymbol;
+   if( index >= metaparam_offset )
+   {
+      pSymbol = "meta_cc" + std::to_string( index - metaparam_offset + 1 );
+   }
+   else
+   {
+      auto *par = _synthesizer->storage.getPatch().param_ptr[index];
+      pSymbol = par->get_storage_name();
+   }
+
+   return pSymbol;
+}
+
+std::string SurgeLv2Wrapper::getParameterUri(unsigned pNth) const
+{
+   return SURGE_PLUGIN_URI "#parameter_" + getParameterSymbol(pNth);
 }
 
 LV2_Descriptor SurgeLv2Wrapper::createDescriptor()
